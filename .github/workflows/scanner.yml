@@ -1,1 +1,69 @@
+name: S&P100 NDX100 Drop Scanner
 
+on:
+  schedule:
+    # 22:30 UTC, Mon-Fri.
+    # US close = 20:00 UTC (DST) / 21:00 UTC (standard time)
+    # 22:30 UTC = 90+ min after close year-round, giving yfinance time to settle.
+    # Note: GitHub cron is best-effort and can be delayed 15+ min during peak load.
+    - cron: '30 22 * * 1-5'
+  workflow_dispatch:   # allow manual runs from the Actions tab
+
+permissions:
+  contents: read
+  issues: write        # needed to open an issue when drops are found
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install yfinance pandas lxml
+
+      - name: Run scanner
+        id: scan
+        run: |
+          python sp100_ndx100_drop_scanner.py --days 1
+          CSV=$(ls daily_drops_*.csv 2>/dev/null | head -1 || true)
+          if [ -n "$CSV" ] && [ "$(wc -l < "$CSV")" -gt 1 ]; then
+            echo "hits=true" >> "$GITHUB_OUTPUT"
+            echo "csv=$CSV"  >> "$GITHUB_OUTPUT"
+          else
+            echo "hits=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload CSV artifact
+        if: steps.scan.outputs.hits == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-drops-${{ github.run_id }}
+          path: daily_drops_*.csv
+          retention-days: 90
+
+      - name: Open issue summarising drops
+        if: steps.scan.outputs.hits == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSV: ${{ steps.scan.outputs.csv }}
+        run: |
+          DATE=$(date -u +%Y-%m-%d)
+          {
+            echo "Daily drop scanner flagged stocks down more than 10% in the S&P 100 / Nasdaq 100 universe."
+            echo ""
+            echo "| Ticker | Date | Prev Close | Close | % Change | Volume | Indices |"
+            echo "|--------|------|-----------:|------:|---------:|-------:|---------|"
+            tail -n +2 "$CSV" | awk -F, '{printf "| %s | %s | %s | %s | %s | %s | %s |\n",$1,$2,$3,$4,$5,$6,$7}'
+            echo ""
+            echo "_From [run #${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}). Full CSV attached as workflow artifact._"
+          } > issue_body.md
+
+          gh issue create \
+            --title "Daily drops $DATE — S&P100 / NDX100" \
+            --body-file issue_body.md
